@@ -1,4 +1,4 @@
-TOKEN = "INSERT YOUR TOKEN IN HERE"
+TOKEN = "MTQwODMxNjY0MzE5MjM0NDYyNg.Gt97g1.qGKtx0qVy8KXxhVnV3ILeBkjfBs82CQG6wg3Vw"
 
 import os
 import json
