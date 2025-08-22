@@ -1,3 +1,5 @@
+TOKEN = "INSERT YOUR TOKEN IN HERE"
+
 import os
 import json
 import asyncio
@@ -14,8 +16,6 @@ from discord.ext import commands
 # =========================
 PREFIX = "!"
 DATA_FILE = "data.json"
-# Optional: Bot token from environment variable (recommended)
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 
 # Intents (Default + Message Content)
