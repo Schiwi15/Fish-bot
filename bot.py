@@ -627,7 +627,27 @@ async def on_command_error(ctx: commands.Context, error):
 # =========================
 # START
 # =========================
+import os
+
 if __name__ == "__main__":
-    if not TOKEN or TOKEN == "PASTE_YOUR_TOKEN_HERE":
-        print("[WARN] Please set DISCORD_BOT_TOKEN env var or paste the token into TOKEN.")
-    bot.run(TOKEN)
+    token_file = "token.txt"
+    TOKEN = None
+
+    # Try reading token from file
+    if os.path.exists(token_file):
+        with open(token_file, "r") as f:
+            TOKEN = f.read().strip()
+
+    # If no token, prompt user
+    if not TOKEN:
+        TOKEN = input("Enter your Discord bot token: ").strip()
+        # Save token to file for next time
+        with open(token_file, "w") as f:
+            f.write(TOKEN)
+        print(f"Token saved to {token_file}.")
+
+    if not TOKEN:
+        print("[ERROR] No token provided. Exiting.")
+    else:
+        bot.run(TOKEN)
+
