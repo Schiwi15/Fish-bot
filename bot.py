@@ -1,64 +1,127 @@
-TOKEN = "MTQwODMxNjY0MzE5MjM0NDYyNg.Gt97g1.qGKtx0qVy8KXxhVnV3ILeBkjfBs82CQG6wg3Vw"
+# bot.py — Discord Economy + Casino + Jobs (hourly pay) + Bank + Interest
+# Requires: discord.py  (pip install discord.py)
 
 import os
 import json
 import asyncio
 import random
 from threading import Lock
-from datetime import datetime
-from typing import Dict, Any, List
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # =========================
 # CONFIG
 # =========================
+TOKEN = os.getenv("DISCORD_BOT_TOKEN") or "PASTE_YOUR_TOKEN_HERE"
 PREFIX = "!"
 DATA_FILE = "data.json"
+JOBS_FILE = "jobs.json"
 
+# Job / Economy Settings
+JOB_OFFERS_COUNT = 3          # wie viele zufällige Jobs angezeigt werden
+JOB_OFFERS_TTL_MIN = 30       # Angebote laufen nach 30 Minuten ab
+BANK_INTEREST_PER_HOUR = 0.01 # 1% pro Stunde (auf Bank)
+HOURLY_LOOP_INTERVAL_MIN = 1  # wie oft wir prüfen (Minuten)
 
-# Intents (Default + Message Content)
+# =========================
+# DISCORD SETUP
+# =========================
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = False  # set True if needed
-
+intents.members = False
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 # =========================
 # PERSISTENCE
 # =========================
 _data_lock = Lock()
-_data: Dict[str, Any] = {}
+_data: Dict[str, Any] = {}   # {"users": { "<uid>": { ... } }, "meta": {...}}
+
+def _now() -> datetime:
+    # wir nutzen naive UTC-zeiten ( kompatibel zu str(datetime.utcnow()) )
+    return datetime.utcnow()
+
+def _iso(dt: Optional[datetime]) -> str:
+    return (dt or _now()).isoformat()
+
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def _ensure_root():
+    global _data
+    if "users" not in _data:
+        _data["users"] = {}
+    if "meta" not in _data:
+        _data["meta"] = {"created_at": _iso(_now())}
 
 def _ensure_user(user_id: int):
+    _ensure_root()
     uid = str(user_id)
-    if uid not in _data.get("users", {}):
+    if uid not in _data["users"]:
         _data["users"][uid] = {
-            "money": 1000,
-            "inventory": []  # List[str]
+            # Neues Schema
+            "wallet": 1000,             # ehemals "money"
+            "bank": 0,
+            "inventory": [],
+            # Jobs
+            "job": None,                # string name
+            "income": 0,                # coins/hour
+            "last_pay": _iso(_now()),   # Zeitstempel letzte Job-Auszahlung
+            # Job-Angebote
+            "job_offers": [],           # Liste von Job-Namen
+            "offers_expires": None,     # ISO
+            # Banking
+            "last_interest": _iso(_now())  # für Zins-Berechnung
         }
+    else:
+        # Migration: money -> wallet
+        prof = _data["users"][uid]
+        if "wallet" not in prof and "money" in prof:
+            prof["wallet"] = prof.get("money", 0)
+        if "bank" not in prof:
+            prof["bank"] = 0
+        if "inventory" not in prof:
+            prof["inventory"] = []
+        if "job" not in prof:
+            prof["job"] = None
+        if "income" not in prof:
+            prof["income"] = 0
+        if "last_pay" not in prof:
+            prof["last_pay"] = _iso(_now())
+        if "job_offers" not in prof:
+            prof["job_offers"] = []
+        if "offers_expires" not in prof:
+            prof["offers_expires"] = None
+        if "last_interest" not in prof:
+            prof["last_interest"] = _iso(_now())
 
 def load_data():
     global _data
     if not os.path.exists(DATA_FILE):
-        _data = {"users": {}, "meta": {"created_at": datetime.utcnow().isoformat()}}
+        _data = {"users": {}, "meta": {"created_at": _iso(_now())}}
         save_data()
         return
     with _data_lock:
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 _data = json.load(f)
-            if "users" not in _data:
-                _data["users"] = {}
+            _ensure_root()
         except Exception:
-            # If file is corrupted, create a new structure (backup old)
-            backup = f"{DATA_FILE}.backup-{int(datetime.utcnow().timestamp())}"
+            # Backup defekter Datei
+            backup = f"{DATA_FILE}.backup-{int(_now().timestamp())}"
             try:
                 os.rename(DATA_FILE, backup)
             except Exception:
                 pass
-            _data = {"users": {}, "meta": {"created_at": datetime.utcnow().isoformat()}}
+            _data = {"users": {}, "meta": {"created_at": _iso(_now())}}
             save_data()
 
 def save_data():
@@ -77,16 +140,53 @@ def set_user_profile(user_id: int, profile: Dict[str, Any]):
     save_data()
 
 # =========================
-# HELPER FUNCTIONS (GAME LOGIC)
+# JOBS IO
 # =========================
-def show_stats_text(money: int, inventory: List[str]) -> str:
-    inv_text = ", ".join(inventory) if inventory else "Empty"
-    return f"💰 **Money:** ${money}\n🎒 **Inventory:** {inv_text}"
+def load_jobs() -> List[Dict[str, Any]]:
+    # Erstelle Standard-Jobs wenn Datei nicht vorhanden
+    if not os.path.exists(JOBS_FILE):
+        jobs = [
+            {"name": "Baker",       "income": 150},
+            {"name": "Programmer",  "income": 300},
+            {"name": "Mechanic",    "income": 200},
+            {"name": "Streamer",    "income": 100},
+            {"name": "Teacher",     "income": 180},
+            {"name": "Pilot",       "income": 400},
+            {"name": "Designer",    "income": 220},
+            {"name": "Doctor",      "income": 260},
+            {"name": "Police",      "income": 210},
+        ]
+        with open(JOBS_FILE, "w", encoding="utf-8") as f:
+            json.dump(jobs, f, indent=2, ensure_ascii=False)
+    with open(JOBS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-def work_income(choice: str) -> int:
-    # Your original: Income 50-300, job selection is just style
-    return random.randint(50, 300)
+def get_random_jobs(jobs: List[Dict[str, Any]], count=JOB_OFFERS_COUNT):
+    return random.sample(jobs, min(count, len(jobs)))
 
+# =========================
+# HELPER (TEXT)
+# =========================
+def show_stats_text(profile: Dict[str, Any]) -> str:
+    inv = profile.get("inventory", [])
+    inv_text = ", ".join(inv) if inv else "Empty"
+    return (
+        f"💰 **Wallet:** ${profile.get('wallet', 0)}\n"
+        f"🏦 **Bank:** ${profile.get('bank', 0)}\n"
+        f"🎒 **Inventory:** {inv_text}\n"
+        f"👔 **Job:** {profile.get('job') or 'None'}"
+    )
+
+# =========================
+# SHOP (wie vorher)
+# =========================
+SHOP_ITEMS = {
+    "watch": {"name": "Watch", "price": 50},
+    "necklace": {"name": "Necklace", "price": 100},
+    "laptop": {"name": "Laptop", "price": 300},
+}
+
+# Roulette & Blackjack
 ROULETTE_CHOICES = {
     "red": "Red",
     "black": "Black",
@@ -98,18 +198,10 @@ def roulette_spin() -> str:
     return random.choice(["Red", "Black", "Odd", "Even"])
 
 def blackjack_draw() -> (int, int):
-    # Your original: 1-11
     return random.randint(1, 11), random.randint(1, 11)
 
 def crime_outcome() -> bool:
     return random.choice([True, False])
-
-# Shop items as in original
-SHOP_ITEMS = {
-    "watch": {"name": "Watch", "price": 50},
-    "necklace": {"name": "Necklace", "price": 100},
-    "laptop": {"name": "Laptop", "price": 300},
-}
 
 # =========================
 # BOT EVENTS
@@ -119,6 +211,9 @@ async def on_ready():
     load_data()
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     await bot.change_presence(activity=discord.Game(name=f"{PREFIX}help"))
+    # Hintergrund-Task für Auszahlungen & Zinsen starten
+    if not hourly_economy.is_running():
+        hourly_economy.start()
 
 # =========================
 # HELP
@@ -126,43 +221,44 @@ async def on_ready():
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
     embed = discord.Embed(
-        title="🎮 Casino RPG – Commands",
+        title="🎮 Economy & Casino – Commands",
         description=f"Prefix: `{PREFIX}`",
         color=0x2ecc71
     )
     embed.add_field(
         name="Profile & Stats",
         value="\n".join([
-            f"`{PREFIX}start` – Create profile (if not existing)",
-            f"`{PREFIX}stats` – Show money & inventory"
+            f"`{PREFIX}start` – Create profile",
+            f"`{PREFIX}stats` – Show wallet, bank, inventory, job",
+            f"`{PREFIX}balance` – Shortcut for wallet & bank"
         ]),
         inline=False
     )
     embed.add_field(
-        name="Work",
+        name="Jobs",
         value="\n".join([
-            f"`{PREFIX}work <developer|teacher|designer>` – Work & earn income"
+            f"`{PREFIX}jobs` – Show {JOB_OFFERS_COUNT} random job offers (valid {JOB_OFFERS_TTL_MIN} min)",
+            f"`{PREFIX}job <number>` – Claim a shown job"
+        ]),
+        inline=False
+    )
+    embed.add_field(
+        name="Bank",
+        value="\n".join([
+            f"`{PREFIX}bank deposit <amount>` – Move from wallet ➜ bank",
+            f"`{PREFIX}bank withdraw <amount>` – Move from bank ➜ wallet",
+            f"💡 Bank earns {int(BANK_INTEREST_PER_HOUR*100)}% interest/hour"
         ]),
         inline=False
     )
     embed.add_field(
         name="Roulette",
-        value="\n".join([
-            f"`{PREFIX}roulette <bet> <red|black|odd|even>` – Place a bet"
-        ]),
+        value=f"`{PREFIX}roulette <bet> <red|black|odd|even>` – Place a bet",
         inline=False
     )
     embed.add_field(
         name="Blackjack",
         value=f"`{PREFIX}blackjack <bet>` – Simple 1-card duel",
-        inline=False
-    )
-    embed.add_field(
-        name="Bank (same as original – **no separate bank balance**)",
-        value="\n".join([
-            f"`{PREFIX}bank deposit <amount>` – Deposit money (deducts from balance)",
-            f"`{PREFIX}bank withdraw <amount>` – Withdraw money (adds to balance)"
-        ]),
         inline=False
     )
     embed.add_field(
@@ -185,113 +281,154 @@ async def help_cmd(ctx: commands.Context):
     await ctx.reply(embed=embed, mention_author=False)
 
 # =========================
-# BASICS: START & STATS
+# BASICS: START, STATS, BALANCE
 # =========================
 @bot.command(name="start")
 async def start_cmd(ctx: commands.Context):
+    load_data()
+    _ensure_user(ctx.author.id)
+    save_data()
     profile = get_user_profile(ctx.author.id)
-    set_user_profile(ctx.author.id, profile)
-    await ctx.reply(f"✨ Profile ready! You start with **$ {profile['money']}**.\n" +
-                    show_stats_text(profile['money'], profile['inventory']),
-                    mention_author=False)
+    await ctx.reply(
+        f"✨ Profile ready! You start with **$ {profile['wallet']}**.\n" +
+        show_stats_text(profile),
+        mention_author=False
+    )
 
 @bot.command(name="stats")
 async def stats_cmd(ctx: commands.Context):
+    load_data()
+    _ensure_user(ctx.author.id)
     profile = get_user_profile(ctx.author.id)
-    await ctx.reply(show_stats_text(profile["money"], profile["inventory"]), mention_author=False)
+    await ctx.reply(show_stats_text(profile), mention_author=False)
+
+@bot.command(name="balance")
+async def balance_cmd(ctx: commands.Context):
+    load_data()
+    _ensure_user(ctx.author.id)
+    p = get_user_profile(ctx.author.id)
+    await ctx.reply(f"💰 Wallet: ${p['wallet']}\n🏦 Bank: ${p['bank']}", mention_author=False)
 
 # =========================
-# WORK
+# JOBS
 # =========================
-@bot.command(name="work")
-async def work_cmd(ctx: commands.Context, job: str = None):
-    if job is None or job.lower() not in {"developer", "teacher", "designer"}:
-        return await ctx.reply("👔 **Choose a job:** `developer`, `teacher`, `designer`", mention_author=False)
+@bot.command(name="jobs")
+async def jobs_cmd(ctx: commands.Context):
+    load_data()
+    prof = get_user_profile(ctx.author.id)
 
-    profile = get_user_profile(ctx.author.id)
-    income = work_income(job.lower())
-    profile["money"] += income
-    set_user_profile(ctx.author.id, profile)
+    # prüfe, ob Angebote existieren & gültig sind
+    offers_valid = False
+    if prof.get("job_offers"):
+        exp = _parse_iso(prof.get("offers_expires"))
+        if exp and _now() < exp:
+            offers_valid = True
 
-    await ctx.reply(f"💼 You worked as **{job.capitalize()}** and earned **${income}**.\n" +
-                    show_stats_text(profile["money"], profile["inventory"]),
-                    mention_author=False)
+    # wenn nicht gültig -> neue generieren
+    if not offers_valid:
+        jobs_list = load_jobs()
+        selected = get_random_jobs(jobs_list, JOB_OFFERS_COUNT)
+        prof["job_offers"] = [j["name"] for j in selected]
+        prof["offers_expires"] = _iso(_now() + timedelta(minutes=JOB_OFFERS_TTL_MIN))
+        set_user_profile(ctx.author.id, prof)
 
-# =========================
-# ROULETTE
-# =========================
-@bot.command(name="roulette")
-async def roulette_cmd(ctx: commands.Context, bet: int = None, choice: str = None):
-    if bet is None or choice is None:
-        return await ctx.reply(f"🎲 Usage: `{PREFIX}roulette <bet> <red|black|odd|even>`", mention_author=False)
-    choice = choice.lower()
-    if choice not in ROULETTE_CHOICES:
-        return await ctx.reply("❌ Invalid choice! Use: `red`, `black`, `odd`, `even`.", mention_author=False)
-    if bet <= 0:
-        return await ctx.reply("❌ Bet must be a positive number.", mention_author=False)
-
-    profile = get_user_profile(ctx.author.id)
-    if bet > profile["money"]:
-        return await ctx.reply("❌ You don't have enough money!", mention_author=False)
-
-    result = roulette_spin()
-
-    msg = await ctx.reply("🎰 Spinning the wheel...", mention_author=False)
-    await asyncio.sleep(2)
-    win = False
-    chosen_result = ROULETTE_CHOICES[choice]
-    if (choice == "red" and result == "Red") or \
-       (choice == "black" and result == "Black") or \
-       (choice == "odd" and result == "Odd") or \
-       (choice == "even" and result == "Even"):
-        win = True
-
-    if win:
-        profile["money"] += bet
-        outcome = "🎉 You won!"
-    else:
-        profile["money"] -= bet
-        outcome = "❌ You lost!"
-
-    set_user_profile(ctx.author.id, profile)
-    await msg.edit(content=f"🎰 The wheel landed on **{result}**!\n{outcome}\n" +
-                            show_stats_text(profile["money"], profile["inventory"]))
-
-# =========================
-# BLACKJACK (simple version as in original)
-# =========================
-@bot.command(name="blackjack")
-async def blackjack_cmd(ctx: commands.Context, bet: int = None):
-    if bet is None:
-        return await ctx.reply(f"🃏 Usage: `{PREFIX}blackjack <bet>`", mention_author=False)
-    if bet <= 0:
-        return await ctx.reply("❌ Bet must be a positive number.", mention_author=False)
-
-    profile = get_user_profile(ctx.author.id)
-    if bet > profile["money"]:
-        return await ctx.reply("❌ You don't have enough money!", mention_author=False)
-
-    player_card, dealer_card = blackjack_draw()
-
-    if player_card > dealer_card:
-        profile["money"] += bet
-        result = "🎉 You won!"
-    elif player_card < dealer_card:
-        profile["money"] -= bet
-        result = "❌ You lost!"
-    else:
-        result = "🤝 It's a tie!"
-
-    set_user_profile(ctx.author.id, profile)
-
+    # Ausgabe
+    jobs_list = load_jobs()
+    job_map = {j["name"]: j for j in jobs_list}
+    lines = []
+    for i, name in enumerate(prof["job_offers"], start=1):
+        info = job_map.get(name, {"income": "?"})
+        lines.append(f"**{i}.** {name} – {info['income']} Coins/hour")
     await ctx.reply(
-        f"🃏 **Blackjack**\nYour card: **{player_card}**\nDealer's card: **{dealer_card}**\n{result}\n" +
-        show_stats_text(profile["money"], profile["inventory"]),
+        "Available jobs (valid until {} UTC):\n{}\n\nUse `!job <number>` to claim."
+        .format(prof['offers_expires'], "\n".join(lines)),
+        mention_author=False
+    )
+
+@bot.command(name="job")
+async def job_cmd(ctx: commands.Context, job_num: int = None):
+    if job_num is None:
+        return await ctx.reply(f"Usage: `{PREFIX}job <number>`", mention_author=False)
+
+    load_data()
+    prof = get_user_profile(ctx.author.id)
+
+    # validiere Angebote
+    exp = _parse_iso(prof.get("offers_expires"))
+    if not prof.get("job_offers") or not exp or _now() > exp:
+        return await ctx.reply("❌ No valid job offers. Use `!jobs` first.", mention_author=False)
+
+    if job_num < 1 or job_num > len(prof["job_offers"]):
+        return await ctx.reply("❌ Invalid job number.", mention_author=False)
+
+    jobs_list = load_jobs()
+    job_map = {j["name"]: j for j in jobs_list}
+
+    chosen_name = prof["job_offers"][job_num - 1]
+    chosen = job_map.get(chosen_name)
+    if not chosen:
+        return await ctx.reply("❌ This job no longer exists.", mention_author=False)
+
+    # Setze Job
+    prof["job"] = chosen["name"]
+    prof["income"] = int(chosen["income"])
+    prof["last_pay"] = _iso(_now())
+
+    # optional: offers invalidieren, damit man nicht mehrfach claimt
+    prof["job_offers"] = []
+    prof["offers_expires"] = None
+
+    set_user_profile(ctx.author.id, prof)
+    await ctx.reply(
+        f"✅ You have taken the job **{chosen['name']}**! Income: {chosen['income']} Coins per hour.",
         mention_author=False
     )
 
 # =========================
-# BANK (as original: only adjusts money – no separate bank balance)
+# PAYOUT & INTEREST (BACKGROUND)
+# =========================
+@tasks.loop(minutes=HOURLY_LOOP_INTERVAL_MIN)
+async def hourly_economy():
+    # Diese Routine:
+    # - zahlt Job-Einkommen für volle Stunden seit last_pay aus
+    # - zahlt Bankzinsen pro vergangener Stunde seit last_interest
+    try:
+        load_data()
+        changed = False
+        now = _now()
+
+        for uid, prof in list(_data.get("users", {}).items()):
+            # JOB-AUSZAHLUNG
+            if prof.get("job") and prof.get("income", 0) > 0:
+                last = _parse_iso(prof.get("last_pay")) or now
+                elapsed = now - last
+                hours = int(elapsed.total_seconds() // 3600)
+                if hours > 0:
+                    payout = prof["income"] * hours
+                    prof["wallet"] = int(prof.get("wallet", 0)) + int(payout)
+                    prof["last_pay"] = _iso(last + timedelta(hours=hours))
+                    changed = True
+
+            # BANK-ZINSEN
+            last_i = _parse_iso(prof.get("last_interest")) or now
+            elapsed_i = now - last_i
+            hours_i = int(elapsed_i.total_seconds() // 3600)
+            if hours_i > 0 and prof.get("bank", 0) > 0 and BANK_INTEREST_PER_HOUR > 0:
+                bank = float(prof.get("bank", 0))
+                # stündlicher Zinseszins
+                for _ in range(hours_i):
+                    bank *= (1.0 + BANK_INTEREST_PER_HOUR)
+                prof["bank"] = int(bank)
+                prof["last_interest"] = _iso(last_i + timedelta(hours=hours_i))
+                changed = True
+
+        if changed:
+            save_data()
+    except Exception as e:
+        print(f"[hourly_economy] error: {e}")
+
+# =========================
+# BANK (separat)
 # =========================
 @bot.group(name="bank", invoke_without_command=True)
 async def bank_group(ctx: commands.Context):
@@ -304,25 +441,27 @@ async def bank_group(ctx: commands.Context):
 async def bank_deposit(ctx: commands.Context, amount: int = None):
     if amount is None or amount <= 0:
         return await ctx.reply("❌ Enter a positive amount.", mention_author=False)
-    profile = get_user_profile(ctx.author.id)
-    if amount > profile["money"]:
-        return await ctx.reply("❌ You don't have enough money!", mention_author=False)
-    profile["money"] -= amount
-    set_user_profile(ctx.author.id, profile)
-    await ctx.reply(f"💵 You deposited **${amount}**.\n" +
-                    show_stats_text(profile["money"], profile["inventory"]),
-                    mention_author=False)
+    load_data()
+    prof = get_user_profile(ctx.author.id)
+    if amount > prof["wallet"]:
+        return await ctx.reply("❌ Not enough in wallet.", mention_author=False)
+    prof["wallet"] -= amount
+    prof["bank"] += amount
+    set_user_profile(ctx.author.id, prof)
+    await ctx.reply(f"💵 Deposited **${amount}**.\n" + show_stats_text(prof), mention_author=False)
 
 @bank_group.command(name="withdraw")
 async def bank_withdraw(ctx: commands.Context, amount: int = None):
     if amount is None or amount <= 0:
         return await ctx.reply("❌ Enter a positive amount.", mention_author=False)
-    profile = get_user_profile(ctx.author.id)
-    profile["money"] += amount
-    set_user_profile(ctx.author.id, profile)
-    await ctx.reply(f"💵 You withdrew **${amount}**.\n" +
-                    show_stats_text(profile["money"], profile["inventory"]),
-                    mention_author=False)
+    load_data()
+    prof = get_user_profile(ctx.author.id)
+    if amount > prof["bank"]:
+        return await ctx.reply("❌ Not enough on bank.", mention_author=False)
+    prof["bank"] -= amount
+    prof["wallet"] += amount
+    set_user_profile(ctx.author.id, prof)
+    await ctx.reply(f"💵 Withdrew **${amount}**.\n" + show_stats_text(prof), mention_author=False)
 
 # =========================
 # SHOP
@@ -349,53 +488,124 @@ async def shop_buy(ctx: commands.Context, item_key: str = None):
     if item_key not in SHOP_ITEMS:
         return await ctx.reply("❌ Invalid item key. Use `shop list`.", mention_author=False)
 
+    load_data()
     profile = get_user_profile(ctx.author.id)
     price = SHOP_ITEMS[item_key]["price"]
     name = SHOP_ITEMS[item_key]["name"]
 
-    if profile["money"] < price:
+    if profile["wallet"] < price:
         return await ctx.reply("❌ You don't have enough money!", mention_author=False)
 
-    profile["money"] -= price
+    profile["wallet"] -= price
     profile["inventory"].append(name)
     set_user_profile(ctx.author.id, profile)
 
     await ctx.reply(f"✅ You bought a **{name}** for **${price}**.\n" +
-                    show_stats_text(profile["money"], profile["inventory"]),
-                    mention_author=False)
+                    show_stats_text(profile), mention_author=False)
 
 # =========================
 # CRIME
 # =========================
 @bot.command(name="rob")
 async def rob_cmd(ctx: commands.Context):
+    load_data()
     profile = get_user_profile(ctx.author.id)
     success = crime_outcome()
     if success:
         reward = random.randint(100, 500)
-        profile["money"] += reward
+        profile["wallet"] += reward
         msg = f"💰 You successfully robbed a store and earned **${reward}**!"
     else:
         penalty = random.randint(50, 150)
-        profile["money"] -= penalty
+        profile["wallet"] -= penalty
         msg = f"❌ You got caught and lost **${penalty}**!"
     set_user_profile(ctx.author.id, profile)
-    await ctx.reply(msg + "\n" + show_stats_text(profile["money"], profile["inventory"]), mention_author=False)
+    await ctx.reply(msg + "\n" + show_stats_text(profile), mention_author=False)
 
 @bot.command(name="scam")
 async def scam_cmd(ctx: commands.Context):
+    load_data()
     profile = get_user_profile(ctx.author.id)
     success = crime_outcome()
     if success:
         reward = random.randint(50, 300)
-        profile["money"] += reward
+        profile["wallet"] += reward
         msg = f"💰 You successfully scammed someone and earned **${reward}**!"
     else:
         penalty = random.randint(25, 100)
-        profile["money"] -= penalty
+        profile["wallet"] -= penalty
         msg = f"❌ You got caught and lost **${penalty}**!"
     set_user_profile(ctx.author.id, profile)
-    await ctx.reply(msg + "\n" + show_stats_text(profile["money"], profile["inventory"]), mention_author=False)
+    await ctx.reply(msg + "\n" + show_stats_text(profile), mention_author=False)
+
+# =========================
+# ROULETTE
+# =========================
+@bot.command(name="roulette")
+async def roulette_cmd(ctx: commands.Context, bet: int = None, choice: str = None):
+    if bet is None or choice is None:
+        return await ctx.reply(f"🎲 Usage: `{PREFIX}roulette <bet> <red|black|odd|even>`", mention_author=False)
+    choice = choice.lower()
+    if choice not in ROULETTE_CHOICES:
+        return await ctx.reply("❌ Invalid choice! Use: `red`, `black`, `odd`, `even`.", mention_author=False)
+    if bet <= 0:
+        return await ctx.reply("❌ Bet must be a positive number.", mention_author=False)
+
+    load_data()
+    profile = get_user_profile(ctx.author.id)
+    if bet > profile["wallet"]:
+        return await ctx.reply("❌ You don't have enough money!", mention_author=False)
+
+    result = roulette_spin()
+
+    msg = await ctx.reply("🎰 Spinning the wheel...", mention_author=False)
+    await asyncio.sleep(2)
+    win = (ROULETTE_CHOICES[choice] == result)
+
+    if win:
+        profile["wallet"] += bet
+        outcome = "🎉 You won!"
+    else:
+        profile["wallet"] -= bet
+        outcome = "❌ You lost!"
+
+    set_user_profile(ctx.author.id, profile)
+    await msg.edit(content=f"🎰 The wheel landed on **{result}**!\n{outcome}\n" +
+                            show_stats_text(profile))
+
+# =========================
+# BLACKJACK
+# =========================
+@bot.command(name="blackjack")
+async def blackjack_cmd(ctx: commands.Context, bet: int = None):
+    if bet is None:
+        return await ctx.reply(f"🃏 Usage: `{PREFIX}blackjack <bet>`", mention_author=False)
+    if bet <= 0:
+        return await ctx.reply("❌ Bet must be a positive number.", mention_author=False)
+
+    load_data()
+    profile = get_user_profile(ctx.author.id)
+    if bet > profile["wallet"]:
+        return await ctx.reply("❌ You don't have enough money!", mention_author=False)
+
+    player_card, dealer_card = blackjack_draw()
+
+    if player_card > dealer_card:
+        profile["wallet"] += bet
+        result = "🎉 You won!"
+    elif player_card < dealer_card:
+        profile["wallet"] -= bet
+        result = "❌ You lost!"
+    else:
+        result = "🤝 It's a tie!"
+
+    set_user_profile(ctx.author.id, profile)
+
+    await ctx.reply(
+        f"🃏 **Blackjack**\nYour card: **{player_card}**\nDealer's card: **{dealer_card}**\n{result}\n" +
+        show_stats_text(profile),
+        mention_author=False
+    )
 
 # =========================
 # ERROR HANDLING
@@ -417,4 +627,7 @@ async def on_command_error(ctx: commands.Context, error):
 # =========================
 # START
 # =========================
+if __name__ == "__main__":
+    if not TOKEN or TOKEN == "PASTE_YOUR_TOKEN_HERE":
+        print("[WARN] Please set DISCORD_BOT_TOKEN env var or paste the token into TOKEN.")
     bot.run(TOKEN)
