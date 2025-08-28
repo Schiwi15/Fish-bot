@@ -838,6 +838,8 @@ async def on_command_error(ctx: commands.Context, error):
 # =========================
 if __name__ == "__main__":
     if not TOKEN or TOKEN == "PASTE_YOUR_TOKEN_HERE":
-        print("[WARN] Please set DISCORD_BOT_TOKEN or paste your token in TOKEN.")
+        TOKEN = input("Enter your Discord bot token: ").strip()
+        if not TOKEN:
+            print("[ERROR] No token provided. Exiting.")
+            exit(1)
     bot.run(TOKEN)
-
