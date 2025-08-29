@@ -880,23 +880,24 @@ async def gitupdate(interaction: discord.Interaction):
 
     await interaction.response.send_message("⬇️ Downloading updates...", ephemeral=True)
 
-    try:
-        # Fetch & reset
-        subprocess.run(["git", "fetch", "origin"], check=True)
-        subprocess.run(["git", "reset", "--hard", "origin/main"], check=True)
+try:
+    # Fetch & reset
+    subprocess.run(["git", "fetch", "origin"], check=True)
+    subprocess.run(["git", "reset", "--hard", "origin/main"], check=True)
 
-        # Get current GitHub tag version
-        version = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"]).decode().strip()
+    # Get current GitHub tag version
+    version = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"]).decode().strip()
 
-        await interaction.followup.send(f"✅ Update complete! Restarting...\nRunning version `{version}`", ephemeral=True)
+    await interaction.followup.send(f"✅ Update complete! Restarting...\nRunning version `{version}`", ephemeral=True)
 
-        # Restart the bot process
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+    # Restart the bot process
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    except subprocess.CalledProcessError as e:
-        await interaction.followup.send(f"❌ Git update failed:\n```\n{e}\n```", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Unexpected error:\n```\n{e}\n```", ephemeral=True)
+except subprocess.CalledProcessError:
+    await interaction.followup.send("❌ Git update failed.", ephemeral=True)
+except Exception as e:
+    await interaction.followup.send(f"❌ Unexpected error:\n```\n{e}\n```", ephemeral=True)
+
 
 
 # =========================
