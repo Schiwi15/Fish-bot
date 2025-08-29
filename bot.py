@@ -9,9 +9,12 @@ import random
 from threading import Lock
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Literal
+import subprocess
+import sys
 
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
 
 # =========================
 # CONFIG
