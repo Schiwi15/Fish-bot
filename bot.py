@@ -254,28 +254,21 @@ def show_stats_text(profile: Dict[str, Any]) -> str:
 # =========================
 # EVENTS
 # =========================
-
 @bot.event
 async def on_ready():
-    # Send restart embed if file exists
-    channel_id_file = "restart_channel.txt"
-    if os.path.exists(channel_id_file):
-        with open(channel_id_file, "r") as f:
-            ch_id = int(f.read().strip())
-        try:
-            channel = bot.get_channel(ch_id)
-            version = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"]).decode().strip()
-            embed = discord.Embed(
-                title="✅ Restart Complete",
-                description=f"Running version `{version}`",
-                color=0x2ecc71
-            )
-            await channel.send(embed=embed)
-        except Exception:
-            pass
-        os.remove(channel_id_file)
-
+    load_data()
+    load_lottery()
+    load_items()
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    await bot.change_presence(activity=discord.Game(name=f"{PREFIX}help"))
+    if not economy_loop.is_running():
+        economy_loop.start()
+    # Slash-Befehle synchronisieren
+    try:
+        await bot.tree.sync()
+        print("✅ Slash-Commands synchronisiert.")
+    except Exception as e:
+        print(f"Slash-Sync Fehler: {e}")
 
 # =========================
 # BACKGROUND LOOP (Jobs zahlen, Effekte aufräumen)
@@ -871,14 +864,10 @@ async def _log_before_invoke(ctx: commands.Context):
         print(f"[CMD] {ctx.author} -> {ctx.command.qualified_name} {ctx.args[2:] if len(ctx.args)>2 else ''}")
     except Exception:
         pass
-# =========================
-# GIT UPDATE COMMAND
-# =========================
 
-import subprocess
-import sys
-import os
-import discord
+# =========================
+# GITUPDATE COMMAND
+# =========================
 
 @bot.tree.command(name="gitupdate", description="Update the bot from GitHub and restart")
 async def gitupdate(interaction: discord.Interaction):
@@ -889,25 +878,20 @@ async def gitupdate(interaction: discord.Interaction):
     await interaction.response.send_message("⬇️ Downloading updates...", ephemeral=True)
 
     try:
-        # Fetch & reset
+        # Fetch & reset explicitly to origin/main
         subprocess.run(["git", "fetch", "origin"], check=True)
         subprocess.run(["git", "reset", "--hard", "origin/main"], check=True)
 
-        # Get current GitHub tag version
+        # Get current Git tag version
         version = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"]).decode().strip()
 
-        # Save channel ID so on_ready can send the restart embed
-        with open("restart_channel.txt", "w") as f:
-            f.write(str(interaction.channel_id))
-
-        # Send a temporary message before restart
         await interaction.followup.send(f"✅ Update complete! Restarting...\nRunning version `{version}`", ephemeral=True)
 
-        # Restart the bot process
+        # Restart bot
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    except subprocess.CalledProcessError:
-        await interaction.followup.send("❌ Git update failed.", ephemeral=True)
+    except subprocess.CalledProcessError as e:
+        await interaction.followup.send(f"❌ Git update failed:\n```\n{e}\n```", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Unexpected error:\n```\n{e}\n```", ephemeral=True)
 
@@ -917,13 +901,4 @@ async def gitupdate(interaction: discord.Interaction):
 if __name__ == "__main__":
     if not TOKEN or TOKEN == "PASTE_YOUR_TOKEN_HERE":
         print("[WARN] Please set DISCORD_BOT_TOKEN or paste your token in TOKEN.")
-
-    # Try to get the current Git tag version
-    try:
-        version = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"]).decode().strip()
-    except Exception:
-        version = "unknown"
-
-    print(f"✅ Restart complete! Running version {version}")
     bot.run(TOKEN)
-
