@@ -8,7 +8,7 @@ import asyncio
 import random
 from threading import Lock
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Literal
 
 import discord
 from discord.ext import commands, tasks
@@ -63,6 +63,7 @@ DEFAULT_ITEMS = [
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # für robustere Member-Operationen (rob, leaderboard-Namen etc.)
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 # =========================
@@ -106,15 +107,8 @@ def _ensure_user(user_id: int):
             "last_pay": _iso(_now()),
             "job_offers": [],
             "offers_expires": None,
-            "last_interest": _iso(_now()),  # (reserviert falls du später Zinsen nutzt)
-            # Effekte
-            "effects": {  # aktive Effekte mit Ablauf
-                # "shield": {"until": ISO},
-                # "job_boost": {"until": ISO, "percent": 10},
-                # "luck_boost": {"until": ISO, "percent": 5},
-                # "interest_boost": {"until": ISO, "percent": 10}
-            },
-            # Rob
+            "last_interest": _iso(_now()),
+            "effects": {},
             "rob_cooldown_until": None,
         }
     else:
@@ -215,7 +209,7 @@ def get_random_jobs(jobs: List[Dict[str, Any]], count=JOB_OFFERS_COUNT):
 # =========================
 def effect_active(profile: Dict[str, Any], key: str) -> Optional[Dict[str, Any]]:
     eff = profile.get("effects", {}).get(key)
-    if not eff: 
+    if not eff:
         return None
     until = _parse_iso(eff.get("until"))
     if until and _now() < until:
@@ -558,7 +552,10 @@ async def slots_cmd(ctx: commands.Context, bet: int):
     set_user_profile(ctx.author.id, prof)
 
     outcome = "🎉 JACKPOT!" if win_mult == SLOTS_JACKPOT_MULT else ("✅ Small win!" if win_mult == SLOTS_TWOMATCH_MULT else "❌ No win.")
-    await ctx.reply(f"🎰 | {' '.join(rolls)} | {outcome}\nYou {'won' if winnings>0 else 'lost'} **${abs(winnings - 0 if winnings>0 else bet)}**.\n" + show_stats_text(prof), mention_author=False)
+    # Net change anzeigen
+    change = winnings if winnings > 0 else -bet
+    change_str = f"+${change}" if change > 0 else f"-${abs(change)}"
+    await ctx.reply(f"🎰 | {' '.join(rolls)} | {outcome}\nResult: **{change_str}**\n" + show_stats_text(prof), mention_author=False)
 
 # =========================
 # LOTTERY (hybrid)
@@ -643,7 +640,7 @@ async def rob_cmd(ctx: commands.Context, user: discord.Member):
         attacker["wallet"] += loot
         msg = f"😈 Success! You stole **${loot}** from {user.mention}."
     else:
-        fine = random.randint(ROB_FAIL_FINE_MIN, ROB_FAIL_FINE_MAX)
+        fine = random.randint(ROB_FAIL_FINE_MIN, ROB_FAIL_FAIL_MAX) if 'ROB_FAIL_FAIL_MAX' in globals() else random.randint(ROB_FAIL_FINE_MIN, ROB_FAIL_FINE_MAX)
         fine = min(fine, attacker["wallet"])
         attacker["wallet"] -= fine
         msg = f"🚨 Caught! You paid a fine of **${fine}**."
@@ -733,12 +730,9 @@ def roulette_spin() -> str:
     return random.choice(list(ROULETTE_CHOICES.values()))
 
 @commands.hybrid_command(name="roulette", description="Roulette bet")
-async def roulette_cmd(ctx: commands.Context, bet: int, choice: str):
+async def roulette_cmd(ctx: commands.Context, bet: int, choice: Literal["red", "black", "odd", "even"]):
     if bet <= 0:
         return await ctx.reply("❌ Bet must be positive.", mention_author=False)
-    choice = choice.lower()
-    if choice not in ROULETTE_CHOICES:
-        return await ctx.reply("❌ Use: red, black, odd, even.", mention_author=False)
 
     load_data()
     profile = get_user_profile(ctx.author.id)
@@ -808,6 +802,11 @@ async def leaderboard_cmd(ctx: commands.Context):
     lines = []
     for idx, (uid, net) in enumerate(top, start=1):
         member = ctx.guild.get_member(int(uid))
+        if not member:
+            try:
+                member = await ctx.guild.fetch_member(int(uid))
+            except Exception:
+                member = None
         name = member.display_name if member else f"User {uid}"
         lines.append(f"**{idx}.** {name} – ${net}")
     if not lines:
@@ -817,29 +816,59 @@ async def leaderboard_cmd(ctx: commands.Context):
 # =========================
 # ERROR HANDLING
 # =========================
+# Prefix/hybrid (Prefix-Seite)
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
-    if isinstance(error, commands.MissingPermissions):
-        return await ctx.reply("❌ You don't have permission.", mention_author=False)
-    if isinstance(error, commands.BadArgument):
-        return await ctx.reply("❌ Invalid argument.", mention_author=False)
-    if isinstance(error, commands.MissingRequiredArgument):
-        return await ctx.reply("❌ Missing argument.", mention_author=False)
-    if isinstance(error, commands.CommandNotFound):
-        return
     try:
-        await ctx.reply("⚠️ An error occurred.", mention_author=False)
+        if isinstance(error, commands.CommandNotFound):
+            return
+        if isinstance(error, commands.MissingPermissions):
+            return await ctx.reply("❌ You don't have permission.", mention_author=False)
+        if isinstance(error, commands.MissingRequiredArgument):
+            return await ctx.reply(f"❌ Missing argument.", mention_author=False)
+        if isinstance(error, commands.BadArgument):
+            return await ctx.reply("❌ Invalid argument.", mention_author=False)
+        await ctx.reply(f"⚠️ An error occurred: {error}", mention_author=False)
     except Exception:
         pass
+    # Für Logs
     raise error
+
+# Slash/hybrid (App-Commands-Seite)
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
+    # Versuche, dem Nutzer eine sichtbare Fehlermeldung zu geben (ephemeral)
+    try:
+        content = "⚠️ An error occurred while executing the command."
+        if isinstance(error, discord.app_commands.MissingPermissions):
+            content = "❌ You don't have permission."
+        elif isinstance(error, discord.app_commands.CommandInvokeError):
+            # eigentliche Exception innen
+            inner = getattr(error, "original", None)
+            content = f"⚠️ Error: {inner or error}"
+        elif isinstance(error, discord.app_commands.TransformError):
+            content = "❌ Invalid argument."
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=True)
+        else:
+            await interaction.response.send_message(content, ephemeral=True)
+    except Exception:
+        pass
+    # Zusätzlich im Log ausgeben
+    print(f"[slash error] {repr(error)}")
+
+# Optional: einfaches Logging vor jedem Command
+@bot.before_invoke
+async def _log_before_invoke(ctx: commands.Context):
+    try:
+        print(f"[CMD] {ctx.author} -> {ctx.command.qualified_name} {ctx.args[2:] if len(ctx.args)>2 else ''}")
+    except Exception:
+        pass
 
 # =========================
 # START
 # =========================
 if __name__ == "__main__":
     if not TOKEN or TOKEN == "PASTE_YOUR_TOKEN_HERE":
-        TOKEN = input("Enter your Discord bot token: ").strip()
-        if not TOKEN:
-            print("[ERROR] No token provided. Exiting.")
-            exit(1)
+        print("[WARN] Please set DISCORD_BOT_TOKEN or paste your token in TOKEN.")
     bot.run(TOKEN)
