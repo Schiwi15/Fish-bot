@@ -872,6 +872,11 @@ async def _log_before_invoke(ctx: commands.Context):
 # GITUPDATE COMMAND
 # =========================
 
+import discord
+import subprocess
+import sys
+import os
+
 @bot.tree.command(name="gitupdate", description="Update the bot from GitHub and restart")
 async def gitupdate(interaction: discord.Interaction):
     allowed_ids = [1121504039146889248, 806806527192334356]
@@ -881,22 +886,28 @@ async def gitupdate(interaction: discord.Interaction):
     await interaction.response.send_message("⬇️ Downloading updates...", ephemeral=True)
 
     try:
-        # Fetch & reset explicitly to origin/main
+        # Fetch & reset
         subprocess.run(["git", "fetch", "origin"], check=True)
         subprocess.run(["git", "reset", "--hard", "origin/main"], check=True)
 
-        # Get current Git tag version
-        version = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"]).decode().strip()
+        # Get latest commit hash
+        version = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode().strip()
 
-        await interaction.followup.send(f"✅ Update complete! Restarting...\nRunning version `{version}`", ephemeral=True)
+        # Send embed in the channel where command was executed
+        embed = discord.Embed(
+            title="✅ Update complete! Restarting...",
+            description=f"Running version `{version}`",
+            color=0x00FF00
+        )
+        await interaction.channel.send(embed=embed)
 
-        # Restart bot
+        # Restart the bot process
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    except subprocess.CalledProcessError as e:
-        await interaction.followup.send(f"❌ Git update failed:\n```\n{e}\n```", ephemeral=True)
+    except subprocess.CalledProcessError:
+        await interaction.channel.send("❌ Git update failed.")
     except Exception as e:
-        await interaction.followup.send(f"❌ Unexpected error:\n```\n{e}\n```", ephemeral=True)
+        await interaction.channel.send(f"❌ Unexpected error:\n```\n{e}\n```")
 
 # =========================
 # START
