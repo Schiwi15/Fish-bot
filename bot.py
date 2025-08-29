@@ -868,48 +868,36 @@ async def _log_before_invoke(ctx: commands.Context):
 # GIT UPDATE COMMAND
 # =========================
 
-import discord
-from discord.ext import commands
 import subprocess
-import os
 import sys
+import os
 
-bot = commands.Bot(command_prefix="/", intents=discord.Intents.all())
+@bot.tree.command(name="gitupdate", description="Update the bot from GitHub and restart")
+async def gitupdate(interaction: discord.Interaction):
+    allowed_ids = [1121504039146889248, 806806527192334356]
+    if interaction.user.id not in allowed_ids:
+        return await interaction.response.send_message("❌ You are not authorized.", ephemeral=True)
 
-@bot.command(name="gitupdate")
-async def gitupdate(ctx):
-    if ctx.author.id not in [1121504039146889248, 806806527192334356]:
-        await ctx.send("❌ You don't have permission to run this command.")
-        return
-
-    msg = await ctx.send("📥 Downloading latest version from Git...")
+    await interaction.response.send_message("⬇️ Downloading updates...", ephemeral=True)
 
     try:
-        result = subprocess.run(
-            ["git", "fetch", "origin"],
-            cwd="/root/Fish-bot",
-            capture_output=True,
-            text=True
-        )
-        reset = subprocess.run(
-            ["git", "reset", "--hard", "origin/main"],
-            cwd="/root/Fish-bot",
-            capture_output=True,
-            text=True
-        )
+        # Fetch & reset
+        subprocess.run(["git", "fetch", "origin"], check=True)
+        subprocess.run(["git", "reset", "--hard", "origin/main"], check=True)
 
-        output = f"**Fetch output:**\n{result.stdout or result.stderr}\n"
-        output += f"**Reset output:**\n{reset.stdout or reset.stderr}\n"
+        # Get current GitHub tag version
+        version = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"]).decode().strip()
 
-        await msg.edit(content="✅ Git update complete.\n" + (output[:1800] if output else "No output."))
+        await interaction.followup.send(f"✅ Update complete! Restarting...\nRunning version `{version}`", ephemeral=True)
 
-        await ctx.send("🔄 Restarting bot with new changes...")
-
-        # Restart bot by replacing current process
+        # Restart the bot process
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
+    except subprocess.CalledProcessError as e:
+        await interaction.followup.send(f"❌ Git update failed:\n```\n{e}\n```", ephemeral=True)
     except Exception as e:
-        await msg.edit(content=f"⚠️ Error while running git update:\n```\n{e}\n```")
+        await interaction.followup.send(f"❌ Unexpected error:\n```\n{e}\n```", ephemeral=True)
+
 
 # =========================
 # START
