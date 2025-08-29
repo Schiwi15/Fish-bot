@@ -898,8 +898,6 @@ except subprocess.CalledProcessError:
 except Exception as e:
     await interaction.followup.send(f"❌ Unexpected error:\n```\n{e}\n```", ephemeral=True)
 
-
-
 # =========================
 # START
 # =========================
